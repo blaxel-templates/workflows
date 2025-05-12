@@ -1,26 +1,48 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - "main"
-      - "develop"
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+    secrets:
+      BL_ADMIN_USERNAME_DEV:
+        required: true
+      BL_ADMIN_PASSWORD_DEV:
+        required: true
+      BL_ADMIN_USERNAME_PROD:
+        required: true
+      BL_ADMIN_PASSWORD_PROD:
+        required: true
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Clone ${{ inputs.repository }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
       - name: Release
         env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          BL_API_URL: ${{ github.ref_name == 'main' && vars.BL_API_URL_PROD || vars.BL_API_URL_DEV }}
-          BL_ADMIN_USERNAME: ${{ github.ref_name == 'main' && secrets.BL_ADMIN_USERNAME_PROD || secrets.BL_ADMIN_USERNAME_DEV }}
-          BL_ADMIN_PASSWORD: ${{ github.ref_name == 'main' && secrets.BL_ADMIN_PASSWORD_PROD || secrets.BL_ADMIN_PASSWORD_DEV }}
-          SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ inputs.repository }}
+          BL_API_URL: ${{ inputs.environment == 'prod' && vars.BL_ADMIN_API_URL_PROD || vars.BL_ADMIN_API_URL_DEV }}
+          BL_ADMIN_USERNAME: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_USERNAME_PROD || secrets.BL_ADMIN_USERNAME_DEV }}
+          BL_ADMIN_PASSWORD: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_PASSWORD_PROD || secrets.BL_ADMIN_PASSWORD_DEV }}
+          SHA: ${{ inputs.sha }}
         run: |
           # Directory to scan (default: current directory)
+
+          echo "BL_API_URL: $BL_API_URL"
+          echo "SHA: $SHA"
 
           tmpfile=$(mktemp)
 
@@ -70,7 +92,7 @@ jobs:
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
 
-          repo_json=$(curl --fail -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME")
+          repo_json=$(curl --fail -s "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME")
 
           # Parse values
           DESCRIPTION=$(echo "$repo_json" | jq -r '.description')
@@ -81,6 +103,7 @@ jobs:
           ICON=https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/icon.png
           ICON_DARK=https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/icon-dark.png
           URL="https://github.com/$REPO_OWNER/$REPO_NAME"
+
 
           # Output the final JSON
           body='{
@@ -103,7 +126,7 @@ jobs:
           echo "\n\nCalling $BL_API_URL/admin/templates/$REPO_NAME\n------------------\n\n"
 
           echo "$body" > body.json
-          curl -v -X PUT --fail -H "Content-Type: application/json" \
+          curl -X PUT --fail -H "Content-Type: application/json" \
             -d @body.json \
             $BL_API_URL/admin/templates/$REPO_NAME \
             -u $BL_ADMIN_USERNAME:$BL_ADMIN_PASSWORD

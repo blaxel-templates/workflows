@@ -1,0 +1,4 @@
+.prod.env
+.dev.env
+.prod.vars
+.dev.vars
