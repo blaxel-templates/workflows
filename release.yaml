@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - "main"
+      - "develop"
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Release
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          BL_API_URL: ${{ github.ref_name == 'main' && vars.BL_API_URL_PROD || vars.BL_API_URL_DEV }}
+          BL_ADMIN_USERNAME: ${{ github.ref_name == 'main' && secrets.BL_ADMIN_USERNAME_PROD || secrets.BL_ADMIN_USERNAME_DEV }}
+          BL_ADMIN_PASSWORD: ${{ github.ref_name == 'main' && secrets.BL_ADMIN_PASSWORD_PROD || secrets.BL_ADMIN_PASSWORD_DEV }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Directory to scan (default: current directory)
+
+          tmpfile=$(mktemp)
+
+          # Find all relevant files
+          find . -type f \( -iname "*.yaml" -o -iname "*.yml" -o -iname "*.toml" \) -not -path "*/.github/workflows/*" | while read -r file; do
+            # Read file content
+            content=$(cat "$file")
+
+            # Extract variables using regex (matches $secrets.VAR, ${secrets.VAR}, $VAR)
+            # The regex is similar to the Go version
+            grep -oE '\$secrets\.[A-Z0-9_]+|\$\{secrets\.[A-Z0-9_]+\}|\$[A-Z0-9_]+' "$file" | while read -r match; do
+              secret="false"
+              varname=""
+              integration=""
+
+              if [[ "$match" =~ ^\$secrets\.([A-Z0-9_]+)$ ]]; then
+                varname="${BASH_REMATCH[1]}"
+                secret="true"
+              elif [[ "$match" =~ ^\$\{secrets\.([A-Z0-9_]+)\}$ ]]; then
+                varname="${BASH_REMATCH[1]}"
+                secret="true"
+              elif [[ "$match" =~ ^\$([A-Z0-9_]+)$ ]]; then
+                varname="${BASH_REMATCH[1]}"
+              fi
+
+              # For YAML files, try to detect IntegrationConnection (very basic, not a real YAML parser)
+              if [[ "$file" =~ \.ya?ml$ ]]; then
+                if grep -q "kind: IntegrationConnection" "$file" && grep -q "$varname" "$file"; then
+                  # Improved extraction for integration value
+                  integration=$(awk '/kind: IntegrationConnection/,/^---/ {if ($0 ~ /integration:[ ]*/) {split($0, a, ":"); gsub(/^ +| +$/, "", a[2]); print a[2]}}' "$file" | head -n1)
+                fi
+              fi
+
+              # Append to variables_json
+              variable_obj="{\"name\":\"$varname\",\"description\":\"Variable found in $file\",\"path\":\"$file\",\"secret\":$secret,\"integration\":\"$integration\"}"
+              echo "$variable_obj" >> "$tmpfile"
+            done
+          done
+
+          # Wait for all background jobs to finish (if any)
+          wait
+
+          variables_json=$(paste -sd, "$tmpfile")
+          rm "$tmpfile"
+
+          # Fetch repo info
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+
+          repo_json=$(curl --fail -s -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME")
+
+          # Parse values
+          DESCRIPTION=$(echo "$repo_json" | jq -r '.description')
+          STAR_COUNT=$(echo "$repo_json" | jq -r '.stargazers_count')
+          FORKS_COUNT=$(echo "$repo_json" | jq -r '.forks_count')
+          TOPICS=$(echo "$repo_json" | jq -c '.topics')
+          DEFAULT_BRANCH=$(echo "$repo_json" | jq -r '.default_branch')
+          ICON=https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/icon.png
+          ICON_DARK=https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/icon-dark.png
+          URL="https://github.com/$REPO_OWNER/$REPO_NAME"
+
+          # Output the final JSON
+          body='{
+            "name": "'"$REPO_NAME"'",
+            "description": "'"$DESCRIPTION"'",
+            "url": "'"$URL"'",
+            "topics": '$TOPICS',
+            "defaultBranch": "'"$DEFAULT_BRANCH"'",
+            "icon": "'"$ICON"'",
+            "iconDark": "'"$ICON_DARK"'",
+            "starCount": '$STAR_COUNT',
+            "downloadCount": 0,
+            "forksCount": '$FORKS_COUNT',
+            "sha": "'"$SHA"'",
+            "variables": [
+              '$variables_json'
+            ]
+          }'
+          echo $body | jq
+          echo "\n\nCalling $BL_API_URL/admin/templates/$REPO_NAME\n------------------\n\n"
+
+          echo "$body" > body.json
+          curl -v -X PUT --fail -H "Content-Type: application/json" \
+            -d @body.json \
+            $BL_API_URL/admin/templates/$REPO_NAME \
+            -u $BL_ADMIN_USERNAME:$BL_ADMIN_PASSWORD
