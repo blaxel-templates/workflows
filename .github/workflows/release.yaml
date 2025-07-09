@@ -45,6 +45,7 @@ jobs:
           echo "SHA: $SHA"
 
           tmpfile=$(mktemp)
+          declare -A seen_variables
 
           # Find all relevant files
           find . -type f \( -iname "*.yaml" -o -iname "*.yml" -o -iname "*.toml" \) -not -path "*/.github/workflows/*" | while read -r file; do
@@ -67,6 +68,14 @@ jobs:
               elif [[ "$match" =~ ^\$([A-Z0-9_]+)$ ]]; then
                 varname="${BASH_REMATCH[1]}"
               fi
+
+              # Skip if we've already seen this variable
+              if [[ -n "${seen_variables[$varname]}" ]]; then
+                continue
+              fi
+
+              # Mark this variable as seen
+              seen_variables[$varname]=1
 
               # For YAML files, try to detect IntegrationConnection (very basic, not a real YAML parser)
               if [[ "$file" =~ \.ya?ml$ ]]; then
