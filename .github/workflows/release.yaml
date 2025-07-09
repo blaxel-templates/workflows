@@ -45,9 +45,9 @@ jobs:
           echo "SHA: $SHA"
 
           tmpfile=$(mktemp)
-          declare -A seen_variables
+          tmpfile_all=$(mktemp)
 
-          # Find all relevant files
+          # Find all relevant files and collect all variables first
           find . -type f \( -iname "*.yaml" -o -iname "*.yml" -o -iname "*.toml" \) -not -path "*/.github/workflows/*" | while read -r file; do
             # Read file content
             content=$(cat "$file")
@@ -69,14 +69,6 @@ jobs:
                 varname="${BASH_REMATCH[1]}"
               fi
 
-              # Skip if we've already seen this variable
-              if [[ -n "${seen_variables[$varname]}" ]]; then
-                continue
-              fi
-
-              # Mark this variable as seen
-              seen_variables[$varname]=1
-
               # For YAML files, try to detect IntegrationConnection (very basic, not a real YAML parser)
               if [[ "$file" =~ \.ya?ml$ ]]; then
                 if grep -q "kind: IntegrationConnection" "$file" && grep -q "$varname" "$file"; then
@@ -85,17 +77,33 @@ jobs:
                 fi
               fi
 
-              # Append to variables_json
+              # Append to all variables file
               variable_obj="{\"name\":\"$varname\",\"description\":\"Variable found in $file\",\"path\":\"$file\",\"secret\":$secret,\"integration\":\"$integration\"}"
-              echo "$variable_obj" >> "$tmpfile"
+              echo "$variable_obj" >> "$tmpfile_all"
             done
           done
 
           # Wait for all background jobs to finish (if any)
           wait
 
+          # Now deduplicate by variable name, keeping only the first occurrence
+          declare -A seen_variables
+          while IFS= read -r line; do
+            # Extract the variable name from the JSON line
+            varname=$(echo "$line" | sed -n 's/.*"name":"\([^"]*\)".*/\1/p')
+
+            # Skip if we've already seen this variable
+            if [[ -n "${seen_variables[$varname]}" ]]; then
+              continue
+            fi
+
+            # Mark this variable as seen and add to final output
+            seen_variables[$varname]=1
+            echo "$line" >> "$tmpfile"
+          done < "$tmpfile_all"
+
           variables_json=$(paste -sd, "$tmpfile")
-          rm "$tmpfile"
+          rm "$tmpfile" "$tmpfile_all"
 
           # Fetch repo info
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
