@@ -235,7 +235,8 @@ jobs:
               ]
             }')
 
-          JOB_NAME="mk3-build-${IMAGE_NAME}-${IMAGE_TAG//[^a-zA-Z0-9-]/-}-$(date +%s)"
+          SAFE_IMAGE_NAME="${IMAGE_NAME//[^a-zA-Z0-9-]/-}"
+          JOB_NAME="mk3-build-${SAFE_IMAGE_NAME}-${IMAGE_TAG//[^a-zA-Z0-9-]/-}-$(date +%s)"
 
           echo "Submitting Batch job..."
           JOB_SUBMIT=$(aws batch submit-job \
