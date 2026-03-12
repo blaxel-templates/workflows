@@ -1,0 +1,146 @@
+name: Build and Push Image
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      bl_type:
+        required: false
+        type: string
+        default: sandbox
+        description: "Blaxel resource type: 'sandbox' or 'agent'"
+    secrets:
+      BL_ADMIN_USERNAME_DEV:
+        required: true
+      BL_ADMIN_PASSWORD_DEV:
+        required: true
+      BL_ADMIN_USERNAME_PROD:
+        required: true
+      BL_ADMIN_PASSWORD_PROD:
+        required: true
+      DEPOT_PROJECT_ID_DEV:
+        required: true
+      DEPOT_PROJECT_ID_PROD:
+        required: true
+      DEPOT_TOKEN_DEV:
+        required: true
+      DEPOT_TOKEN_PROD:
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  BL_ENV: ${{ inputs.environment == 'prod' && 'prod' || 'dev' }}
+  DEV_IMAGE_BUCKET: controlplane-dev-build-images-eu-west-1-37df18
+  PROD_IMAGE_BUCKET: controlplane-prod-build-images-us-west-2-466b17
+
+jobs:
+  build-ghcr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image-tag: ${{ steps.image-tag.outputs.tag }}
+      image-name: ${{ steps.repo-info.outputs.image-name }}
+    steps:
+      - name: Clone ${{ inputs.repository }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+
+      - name: Extract repo info
+        id: repo-info
+        run: |
+          REPO_NAME="${{ inputs.repository }}"
+          REPO_NAME="${REPO_NAME##*/}"
+          echo "repo-name=${REPO_NAME}" >> $GITHUB_OUTPUT
+          # Image name uses the org and repo name
+          REPO_OWNER="${{ inputs.repository }}"
+          REPO_OWNER="${REPO_OWNER%%/*}"
+          echo "image-name=${REPO_OWNER}/${REPO_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Set image tag
+        id: image-tag
+        run: |
+          SHA_SHORT=$(echo "${{ inputs.sha }}" | cut -c1-7)
+          echo "tag=${SHA_SHORT}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.repo-info.outputs.image-name }}
+          tags: |
+            type=raw,value=${{ steps.image-tag.outputs.tag }}
+            type=raw,value=latest
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-blaxel:
+    runs-on: codebuild-sandbox-${{ github.run_id }}-${{ github.run_attempt }}
+    needs: build-ghcr
+    environment: ${{ inputs.environment }}
+    env:
+      BL_API_URL: ${{ inputs.environment == 'prod' && vars.BL_ADMIN_API_URL_PROD || vars.BL_ADMIN_API_URL_DEV }}
+      BL_ADMIN_USERNAME: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_USERNAME_PROD || secrets.BL_ADMIN_USERNAME_DEV }}
+      BL_ADMIN_PASSWORD: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_PASSWORD_PROD || secrets.BL_ADMIN_PASSWORD_DEV }}
+    steps:
+      - name: Clone workflows repository
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          if ! command -v jq &> /dev/null; then
+            echo "jq not found, installing..."
+            apt-get update && apt-get install -y jq || yum install -y jq
+          else
+            echo "jq is already installed"
+          fi
+
+      - name: Build image in Blaxel
+        env:
+          IMAGE_NAME: ${{ needs.build-ghcr.outputs.image-name }}
+          IMAGE_TAG: ${{ needs.build-ghcr.outputs.image-tag }}
+          BL_TYPE: ${{ inputs.bl_type }}
+          BL_ENV: ${{ env.BL_ENV }}
+          SRC_REGISTRY: ${{ env.REGISTRY }}/${{ needs.build-ghcr.outputs.image-name }}
+          BASE_IMAGE_TAG: ${{ needs.build-ghcr.outputs.image-tag }}
+          BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          LOG_LEVEL: debug
+          IMAGE_BUCKET_MK3: ${{ env.BL_ENV == 'prod' && env.PROD_IMAGE_BUCKET || env.DEV_IMAGE_BUCKET }}
+          DEPOT_PROJECT_ID: ${{ env.BL_ENV == 'prod' && secrets.DEPOT_PROJECT_ID_PROD || secrets.DEPOT_PROJECT_ID_DEV }}
+          BATCH_JOB_QUEUE: ${{ env.BL_ENV == 'prod' && (vars.BATCH_JOB_QUEUE_PROD || 'controlplane-prod-build') || (vars.BATCH_JOB_QUEUE_DEV || 'controlplane-dev-build') }}
+          BATCH_JOB_DEFINITION: ${{ env.BL_ENV == 'prod' && (vars.BATCH_JOB_DEFINITION_PROD || 'controlplane-prod-build') || (vars.BATCH_JOB_DEFINITION_DEV || 'controlplane-dev-build') }}
+          BATCH_REGION: ${{ env.BL_ENV == 'prod' && (vars.BATCH_REGION_PROD || 'us-west-2') || (vars.BATCH_REGION_DEV || 'eu-west-1') }}
+          DEPOT_TOKEN: ${{ env.BL_ENV == 'prod' && secrets.DEPOT_TOKEN_PROD || secrets.DEPOT_TOKEN_DEV }}
+        run: |
+          chmod +x ./scripts/mk3-build.sh
+          ./scripts/mk3-build.sh
