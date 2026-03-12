@@ -161,6 +161,9 @@ jobs:
           LOG_LEVEL="${LOG_LEVEL:-debug}"
           BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-latest}"
 
+          # Extract repo name (strip org prefix)
+          REPO_NAME="${IMAGE_NAME##*/}"
+
           # Map BL_TYPE to the S3 path prefix
           case "$BL_TYPE" in
               sandbox) TYPE_PREFIX="sbx" ;;
@@ -182,7 +185,7 @@ jobs:
           echo "Batch Job Definition: $BATCH_JOB_DEFINITION"
           echo "Batch Region: $BATCH_REGION"
 
-          OUTPUT_S3="s3://$IMAGE_BUCKET_MK3/blaxel/$TYPE_PREFIX/$IMAGE_NAME/$IMAGE_TAG"
+          OUTPUT_S3="s3://$IMAGE_BUCKET_MK3/blaxel/$TYPE_PREFIX/$REPO_NAME/$IMAGE_TAG"
           echo "Target S3 location: $OUTPUT_S3"
 
           # Check if template.json has build.slim set to false
@@ -336,7 +339,7 @@ jobs:
           echo "Calling Blaxel API to register image..."
           echo "URL: $BL_API_URL/admin/images"
           echo "Workspace: $WORKSPACE"
-          echo "Repository: $IMAGE_NAME"
+          echo "Repository: $REPO_NAME"
           echo "Tag: $IMAGE_TAG"
           echo "Payload: $API_PAYLOAD"
 
