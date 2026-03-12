@@ -161,8 +161,9 @@ jobs:
           LOG_LEVEL="${LOG_LEVEL:-debug}"
           BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-latest}"
 
-          # Extract repo name (strip org prefix)
+          # Extract repo name (strip org prefix and "template-" prefix)
           REPO_NAME="${IMAGE_NAME##*/}"
+          REPO_NAME="${REPO_NAME#template-}"
 
           # Map BL_TYPE to the S3 path prefix
           case "$BL_TYPE" in
@@ -317,11 +318,11 @@ jobs:
           API_PAYLOAD=$(jq -n \
             --arg registry "$REGISTRY_URL" \
             --arg workspace "$WORKSPACE" \
-            --arg repository "$IMAGE_NAME" \
-            --arg mk3 "blaxel/blaxel/$TYPE_PREFIX/$IMAGE_NAME:$IMAGE_TAG" \
+            --arg repository "$REPO_NAME" \
+            --arg mk3 "blaxel/blaxel/$TYPE_PREFIX/$REPO_NAME:$IMAGE_TAG" \
             --arg tag "$IMAGE_TAG" \
             --arg registry_type "$REGISTRY_TYPE" \
-            --arg original "$TYPE_PREFIX/$IMAGE_NAME:$IMAGE_TAG" \
+            --arg original "$TYPE_PREFIX/$REPO_NAME:$IMAGE_TAG" \
             --arg region "$BATCH_REGION" \
             --arg bucket "$IMAGE_BUCKET_MK3" \
             '{
