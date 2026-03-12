@@ -105,7 +105,8 @@ jobs:
           cache-to: type=gha,mode=max
 
   build-blaxel:
-    runs-on: codebuild-sandbox-${{ github.run_id }}-${{ github.run_attempt }}
+    runs-on:
+      - codebuild-blaxel-templates-${{ github.run_id }}-${{ github.run_attempt }}
     needs: build-ghcr
     environment: ${{ inputs.environment }}
     env:
