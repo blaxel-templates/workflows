@@ -114,8 +114,10 @@ jobs:
       BL_ADMIN_USERNAME: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_USERNAME_PROD || secrets.BL_ADMIN_USERNAME_DEV }}
       BL_ADMIN_PASSWORD: ${{ inputs.environment == 'prod' && secrets.BL_ADMIN_PASSWORD_PROD || secrets.BL_ADMIN_PASSWORD_DEV }}
     steps:
-      - name: Clone workflows repository
+      - name: Clone ${{ inputs.repository }}
         uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
 
       - name: Install jq
         run: |
@@ -143,5 +145,218 @@ jobs:
           BATCH_REGION: ${{ env.BL_ENV == 'prod' && (vars.BATCH_REGION_PROD || 'us-west-2') || (vars.BATCH_REGION_DEV || 'eu-west-1') }}
           DEPOT_TOKEN: ${{ env.BL_ENV == 'prod' && secrets.DEPOT_TOKEN_PROD || secrets.DEPOT_TOKEN_DEV }}
         run: |
-          chmod +x ./scripts/mk3-build.sh
-          ./scripts/mk3-build.sh
+          set -e
+          set -x
+
+          # Validate required environment variables
+          for var in IMAGE_NAME IMAGE_TAG BL_ENV SRC_REGISTRY BUILD_ID IMAGE_BUCKET_MK3 DEPOT_PROJECT_ID BATCH_JOB_QUEUE BATCH_JOB_DEFINITION BATCH_REGION DEPOT_TOKEN BL_API_URL BL_ADMIN_USERNAME BL_ADMIN_PASSWORD; do
+            if [ -z "${!var}" ]; then
+              echo "Error: $var environment variable is required"
+              exit 1
+            fi
+          done
+
+          # Set defaults for optional variables
+          BL_TYPE="${BL_TYPE:-sandbox}"
+          LOG_LEVEL="${LOG_LEVEL:-debug}"
+          BASE_IMAGE_TAG="${BASE_IMAGE_TAG:-latest}"
+
+          # Map BL_TYPE to the S3 path prefix
+          case "$BL_TYPE" in
+              sandbox) TYPE_PREFIX="sbx" ;;
+              agent)   TYPE_PREFIX="agt" ;;
+              *)
+                  echo "Error: Unknown BL_TYPE '$BL_TYPE'. Must be 'sandbox' or 'agent'."
+                  exit 1
+                  ;;
+          esac
+
+          echo "Starting mk3 build process..."
+          echo "Image Name: $IMAGE_NAME"
+          echo "Image Tag: $IMAGE_TAG"
+          echo "BL Environment: $BL_ENV"
+          echo "BL Type: $BL_TYPE ($TYPE_PREFIX)"
+          echo "Build ID: $BUILD_ID"
+          echo "Base Image Tag: $BASE_IMAGE_TAG"
+          echo "Batch Job Queue: $BATCH_JOB_QUEUE"
+          echo "Batch Job Definition: $BATCH_JOB_DEFINITION"
+          echo "Batch Region: $BATCH_REGION"
+
+          OUTPUT_S3="s3://$IMAGE_BUCKET_MK3/blaxel/$TYPE_PREFIX/$IMAGE_NAME/$IMAGE_TAG"
+          echo "Target S3 location: $OUTPUT_S3"
+
+          # Check if template.json has build.slim set to false
+          NO_SLIM="false"
+          TEMPLATE_FILE=""
+          if [ -f "$IMAGE_NAME/template.json" ]; then
+              TEMPLATE_FILE="$IMAGE_NAME/template.json"
+          elif [ -f "hub/$IMAGE_NAME/template.json" ]; then
+              TEMPLATE_FILE="hub/$IMAGE_NAME/template.json"
+          fi
+
+          if [ -n "$TEMPLATE_FILE" ]; then
+              BUILD_SLIM=$(jq -r 'if .build.slim == false then "false" else "true" end' "$TEMPLATE_FILE")
+              if [ "$BUILD_SLIM" = "false" ]; then
+                  NO_SLIM="true"
+                  echo "Template has build.slim=false, setting NO_SLIM=true"
+              fi
+          fi
+
+          # Build container overrides with environment variables and command for the Batch job.
+          IMAGE_REF="$SRC_REGISTRY:$BASE_IMAGE_TAG"
+          CONTAINER_OVERRIDES=$(jq -n \
+            --arg image "$IMAGE_REF" \
+            --arg otel_enabled "false" \
+            --arg bl_env "$BL_ENV" \
+            --arg output_s3 "$OUTPUT_S3" \
+            --arg no_optimize "false" \
+            --arg depot_token "$DEPOT_TOKEN" \
+            --arg bl_build_id "$BUILD_ID" \
+            --arg bl_type "$BL_TYPE" \
+            --arg bl_generation "mk3" \
+            --arg log_level "$LOG_LEVEL" \
+            --arg depot_project_id "$DEPOT_PROJECT_ID" \
+            --arg no_slim "$NO_SLIM" \
+            '{
+              command: ["--image", $image],
+              environment: [
+                {name: "OTEL_ENABLED", value: $otel_enabled},
+                {name: "BL_ENV", value: $bl_env},
+                {name: "OUTPUT_S3", value: $output_s3},
+                {name: "NO_OPTIMIZE", value: $no_optimize},
+                {name: "DEPOT_TOKEN", value: $depot_token},
+                {name: "BL_BUILD_ID", value: $bl_build_id},
+                {name: "BL_TYPE", value: $bl_type},
+                {name: "BL_GENERATION", value: $bl_generation},
+                {name: "LOG_LEVEL", value: $log_level},
+                {name: "DEPOT_PROJECT_ID", value: $depot_project_id},
+                {name: "IMAGE", value: $image},
+                {name: "NO_SLIM", value: $no_slim}
+              ]
+            }')
+
+          JOB_NAME="mk3-build-${IMAGE_NAME}-${IMAGE_TAG//[^a-zA-Z0-9-]/-}-$(date +%s)"
+
+          echo "Submitting Batch job..."
+          JOB_SUBMIT=$(aws batch submit-job \
+            --job-name "$JOB_NAME" \
+            --job-queue "$BATCH_JOB_QUEUE" \
+            --job-definition "$BATCH_JOB_DEFINITION" \
+            --region "$BATCH_REGION" \
+            --container-overrides "$CONTAINER_OVERRIDES" \
+            --output json)
+
+          JOB_ID=$(echo "$JOB_SUBMIT" | jq -r '.jobId')
+          if [ -z "$JOB_ID" ] || [ "$JOB_ID" = "null" ]; then
+              echo "Error: Failed to submit Batch job"
+              echo "$JOB_SUBMIT" | jq '.'
+              exit 1
+          fi
+
+          echo "Batch job submitted: $JOB_ID"
+          echo "Waiting for job to complete..."
+
+          # Poll for job completion
+          MAX_ATTEMPTS=180
+          POLL_INTERVAL=10
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+              JOB_STATUS=$(aws batch describe-jobs \
+                --jobs "$JOB_ID" \
+                --region "$BATCH_REGION" \
+                --query 'jobs[0].status' \
+                --output text)
+
+              echo "  Attempt $attempt/$MAX_ATTEMPTS: Job status $JOB_STATUS"
+
+              case "$JOB_STATUS" in
+                  SUCCEEDED)
+                      echo "Build completed successfully"
+                      break
+                      ;;
+                  FAILED)
+                      echo "Build failed"
+                      aws batch describe-jobs --jobs "$JOB_ID" --region "$BATCH_REGION" | jq '.jobs[0] | {status, statusReason, container: .container}'
+                      exit 1
+                      ;;
+                  SUBMITTED|PENDING|RUNNABLE|STARTING|RUNNING)
+                      sleep $POLL_INTERVAL
+                      ;;
+                  *)
+                      echo "Unknown job status: $JOB_STATUS"
+                      exit 1
+                      ;;
+              esac
+
+              if [ $attempt -eq $MAX_ATTEMPTS ]; then
+                  echo "Error: Job did not complete within timeout"
+                  exit 1
+              fi
+          done
+
+          # Update image registry after successful build
+          echo "Updating image registry..."
+
+          # Create Basic auth header
+          AUTH_HEADER=$(echo -n "$BL_ADMIN_USERNAME:$BL_ADMIN_PASSWORD" | base64)
+
+          WORKSPACE="blaxel"
+
+          # Determine registry type based on the registry URL
+          if [[ "$SRC_REGISTRY" == *"ghcr.io"* ]]; then
+              REGISTRY_TYPE="github"
+          else
+              REGISTRY_TYPE="docker_hub"
+          fi
+
+          REGISTRY_URL=$(echo "$SRC_REGISTRY" | cut -d'/' -f1)
+
+          API_PAYLOAD=$(jq -n \
+            --arg registry "$REGISTRY_URL" \
+            --arg workspace "$WORKSPACE" \
+            --arg repository "$IMAGE_NAME" \
+            --arg mk3 "blaxel/blaxel/$TYPE_PREFIX/$IMAGE_NAME:$IMAGE_TAG" \
+            --arg tag "$IMAGE_TAG" \
+            --arg registry_type "$REGISTRY_TYPE" \
+            --arg original "$TYPE_PREFIX/$IMAGE_NAME:$IMAGE_TAG" \
+            --arg region "$BATCH_REGION" \
+            --arg bucket "$IMAGE_BUCKET_MK3" \
+            '{
+              registry: $registry,
+              workspace: $workspace,
+              repository: $repository,
+              tag: $tag,
+              registry_type: $registry_type,
+              original: $original,
+              region: $region,
+              bucket: $bucket,
+              mk3: $mk3
+            }')
+
+          echo "Calling Blaxel API to register image..."
+          echo "URL: $BL_API_URL/admin/images"
+          echo "Workspace: $WORKSPACE"
+          echo "Repository: $IMAGE_NAME"
+          echo "Tag: $IMAGE_TAG"
+          echo "Payload: $API_PAYLOAD"
+
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" --request PUT \
+            --url "$BL_API_URL/admin/images" \
+            --header "Authorization: Basic $AUTH_HEADER" \
+            --header "Content-Type: application/json" \
+            --data "$API_PAYLOAD")
+
+          HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n 1)
+          HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
+
+          echo "API Response Status: $HTTP_STATUS"
+          if [ ! -z "$HTTP_BODY" ]; then
+              echo "API Response Body: $HTTP_BODY"
+          fi
+
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "Image successfully registered in Blaxel"
+          else
+              echo "Warning: Failed to register image in Blaxel (HTTP $HTTP_STATUS)"
+          fi
+
+          echo "mk3 build process completed successfully"
